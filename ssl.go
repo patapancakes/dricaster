@@ -1,0 +1,642 @@
+// modified from https://github.com/WiiLink24/wfc-server/blob/main/nas/tls.go
+// licensed under GNU AFFERO GENERAL PUBLIC LICENSE Version 3, see LICENSE
+
+package main
+
+import (
+	"bytes"
+	"crypto/md5"
+	"crypto/rand"
+	"crypto/rc4"
+	"crypto/rsa"
+	"crypto/sha1"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/binary"
+	"encoding/pem"
+	"errors"
+	"fmt"
+	"hash"
+	"io"
+	"log"
+	"net"
+
+	_ "embed"
+)
+
+var (
+	rsaKey            *rsa.PrivateKey
+	serverCertsRecord []byte
+
+	//go:embed data/dricas-ca-cert.pem
+	certAuthorityPEM []byte
+
+	//go:embed data/dricas-cert.pem
+	certPEM []byte
+
+	//go:embed data/dricas-key.pem
+	keyPEM []byte
+)
+
+func setupSSL() error {
+	certAuthorityBlock, _ := pem.Decode(certAuthorityPEM)
+	certBlock, _ := pem.Decode(certPEM)
+	keyBlock, _ := pem.Decode(keyPEM)
+
+	key, err := x509.ParsePKCS8PrivateKey(keyBlock.Bytes)
+	if err != nil {
+		return err
+	}
+
+	rsaKey = key.(*rsa.PrivateKey)
+
+	serverCertsRecord = []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSL 3.0)
+	}
+
+	certLen := len(certBlock.Bytes)
+	certLenCA := len(certAuthorityBlock.Bytes)
+
+	// Length of the record
+	serverCertsRecord = binary.BigEndian.AppendUint16(serverCertsRecord, uint16(certLen+certLenCA+13))
+
+	serverCertsRecord = append(serverCertsRecord, 0xB) // Handshake Type (Certificate)
+
+	// Length of handshake message
+	serverCertsRecord = append(serverCertsRecord, 0x00) // padding byte to fit uint24
+	serverCertsRecord = binary.BigEndian.AppendUint16(serverCertsRecord, uint16(certLen+certLenCA+9))
+
+	// Length of certificates
+	serverCertsRecord = append(serverCertsRecord, 0x00) // padding
+	serverCertsRecord = binary.BigEndian.AppendUint16(serverCertsRecord, uint16(certLen+certLenCA+6))
+
+	// Length of certificate (leaf)
+	serverCertsRecord = append(serverCertsRecord, 0x00) // padding
+	serverCertsRecord = binary.BigEndian.AppendUint16(serverCertsRecord, uint16(certLen))
+
+	// Certificate data (leaf)
+	serverCertsRecord = append(serverCertsRecord, certBlock.Bytes...)
+
+	// Length of certificate (authority)
+	serverCertsRecord = append(serverCertsRecord, 0x00) // padding
+	serverCertsRecord = binary.BigEndian.AppendUint16(serverCertsRecord, uint16(certLenCA))
+
+	// Certificate data (authority)
+	serverCertsRecord = append(serverCertsRecord, certAuthorityBlock.Bytes...)
+
+	serverCertsRecord = append(serverCertsRecord, []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSL 3.0)
+		0x00, 0x04, // Length (4)
+		0x0E,             // Handshake Type (Server Hello Done)
+		0x00, 0x00, 0x00, // Length (0)
+	}...)
+
+	return nil
+}
+
+type sslConn struct {
+	net.Conn
+	handshake bool
+	session   io.ReadWriter
+}
+
+func (c *sslConn) Read(b []byte) (int, error) {
+	if !c.handshake {
+		err := c.handleSSLHandshake()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return c.session.Read(b)
+}
+
+func (c *sslConn) Write(b []byte) (int, error) {
+	if !c.handshake {
+		err := c.handleSSLHandshake()
+		if err != nil {
+			return 0, err
+		}
+	}
+
+	return c.session.Write(b)
+}
+
+func (c *sslConn) Close() error {
+	if c.session != nil {
+		if sslConn, ok := c.session.(*tls.Conn); ok {
+			return sslConn.Close()
+		}
+	}
+	return c.Conn.Close()
+}
+
+// handleSSLHandshake handles the SSL request, and creates sslConn for further communication.
+func (c *sslConn) handleSSLHandshake() (err error) {
+	moduleName := "SSL:" + c.Conn.RemoteAddr().String()
+
+	macFn, cipher, clientCipher, err := handleHandshake(moduleName, c.Conn)
+	if err != nil {
+		return err
+	}
+	if macFn == nil || cipher == nil || clientCipher == nil {
+		return errors.New("invalid SSL handshake result")
+	}
+
+	c.session = &sslSession{
+		Conn:         c.Conn,
+		MacFn:        macFn,
+		Cipher:       cipher,
+		ClientCipher: clientCipher,
+		Seq:          1,
+	}
+	c.handshake = true
+	return nil
+}
+
+type sslSession struct {
+	net.Conn
+	BufferSize    int
+	MacFn         macFunction
+	Cipher        *rc4.Cipher
+	ClientCipher  *rc4.Cipher
+	Seq           uint64
+	decodedBuffer bytes.Buffer
+	encodedBuffer bytes.Buffer
+}
+
+func (s *sslSession) Read(b []byte) (n int, err error) {
+	if s.decodedBuffer.Len() != 0 {
+		return s.decodedBuffer.Read(b)
+	}
+
+	recordLength := uint16(0)
+	for {
+		for s.encodedBuffer.Len() < int(recordLength)+5 {
+			readBuf := make([]byte, 1024)
+			n, err = s.Conn.Read(readBuf)
+			if err != nil {
+				return 0, err
+			}
+			s.encodedBuffer.Write(readBuf[:n])
+		}
+
+		buf := s.encodedBuffer.Bytes()
+		if buf[0] < 0x15 || buf[0] > 0x17 {
+			return 0, errors.New("invalid record type")
+		}
+
+		if buf[1] != 0x03 || buf[2] != 0x00 {
+			return 0, errors.New("invalid SSL version")
+		}
+
+		recordLength = binary.BigEndian.Uint16(buf[3:5])
+		if recordLength < 17 || (recordLength+5) > 0x1000 {
+			return 0, errors.New("invalid record length")
+		}
+
+		if s.encodedBuffer.Len() >= int(recordLength)+5 {
+			break
+		}
+	}
+
+	buf := s.encodedBuffer.Bytes()
+	// Decrypt content
+	s.ClientCipher.XORKeyStream(buf[5:5+recordLength], buf[5:5+recordLength])
+
+	if buf[0] != 0x17 {
+		if buf[0] == 0x15 || buf[5] == 0x01 || buf[6] == 0x00 {
+			// Alert: connection closed
+			err = s.Close()
+			if err != nil {
+				return 0, err
+			}
+			return 0, io.EOF
+		}
+		return 0, errors.New("non-application data received")
+	}
+	// Write the decrypted content to the buffer
+	if int(recordLength-16) > len(b) {
+		s.decodedBuffer.Write(buf[5+len(b) : 5+recordLength-16])
+	}
+	s.encodedBuffer.Next(5 + int(recordLength))
+
+	return copy(b, buf[5:5+recordLength-16]), nil
+}
+
+func (s *sslSession) Write(b []byte) (n int, err error) {
+	var record []byte
+	record, s.Seq = encryptSSL(s.MacFn, s.Cipher, b, s.Seq, []byte{0x17, 0x03, 0x01, byte(len(b) >> 8), byte(len(b))})
+	return s.Conn.Write(record)
+}
+
+func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, cipher *rc4.Cipher, clientCipher *rc4.Cipher, err error) {
+	in := make([]byte, 1400)
+	n, err := conn.Read(in)
+	if err != nil {
+		log.Println(moduleName, "Failed to read client hello:", err)
+		return
+	}
+	if n < 0x20 {
+		log.Println(moduleName, "Client hello too short")
+		return
+	}
+
+	clientHello := in[:n]
+
+	finishHash := newFinishedHash()
+	finishHash.Write(clientHello[2:]) // skip SSLv2 length bytes
+
+	// assume 32 byte challenge
+	clientRandom := clientHello[len(clientHello)-0x20:]
+
+	serverHello := []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSL 3.0)
+		0x00, 0x2A, // Length (42)
+		0x02,             // Handshake Type (Server Hello)
+		0x00, 0x00, 0x26, // Length (38)
+		0x03, 0x00, // Version (SSL 3.0)
+	}
+
+	serverRandom := make([]byte, 0x20)
+	_, err = rand.Read(serverRandom)
+	if err != nil {
+		log.Println(moduleName, "Failed to generate random bytes:", err)
+		return
+	}
+
+	serverHello = append(serverHello, serverRandom...)
+
+	// Send an empty session ID
+	serverHello = append(serverHello, 0x00)
+
+	// Select cipher suite SSL_RSA_WITH_RC4_128_MD5 (0x0004) and compression method NULL
+	serverHello = append(serverHello, []byte{
+		0x00, 0x04, 0x00,
+	}...)
+
+	// Append the certs record to the server hello buffer
+	serverHello = append(serverHello, serverCertsRecord...)
+
+	finishHash.Write(serverHello[0x5:0x2F])
+	finishHash.Write(serverHello[0x34 : 0x34+(len(serverCertsRecord)-14)])
+	finishHash.Write(serverHello[0x34+(len(serverCertsRecord)-14)+5 : 0x34+(len(serverCertsRecord)-14)+5+4])
+
+	_, err = conn.Write(serverHello)
+	if err != nil {
+		log.Println(moduleName, "Failed to write to client:", err)
+		return
+	}
+
+	buf := make([]byte, 0x1000)
+	index := 0
+	// Read client key exchange (+ change cipher spec + finished)
+	for {
+		var n int
+		n, err = conn.Read(buf[index:])
+		if err != nil {
+			log.Println(moduleName, "Failed to read client key exchange:", err)
+			return
+		}
+
+		index += n
+
+		// Check client key exchange header
+		if !bytes.HasPrefix(buf, []byte{
+			0x16,       // Content Type (Handshake)
+			0x03, 0x00, // Version (SSL 3.0)
+			0x00, 0x84, // Length (132)
+
+			// the dreamcast sends these in a separate packet
+			//0x10,             // Handshake Type (Client Key Exchange)
+			//0x00, 0x00, 0x80, // Length (128)
+		}) {
+			log.Println(moduleName, "Invalid client key exchange header:", fmt.Sprintf("% X ", buf[:min(index, 0x09-4)]))
+			err = errors.New("invalid client key exchange header")
+			return
+		}
+
+		if index > 0x8B {
+			// Check change cipher spec + finished header
+			if !bytes.HasPrefix(buf[0x89:], []byte{
+				0x14,       // Content Type (Change Cipher Spec)
+				0x03, 0x00, // Version (SSL 3.0)
+				0x00, 0x01, // Length (1)
+				0x01, // Change Cipher Spec Message
+
+				0x16,       // Content Type (Handshake)
+				0x03, 0x00, // Version (SSL 3.0)
+				0x00, 0x38, // Length (56)
+			}) {
+				log.Println(moduleName, "Invalid client change cipher spec + finished header:", fmt.Sprintf("%X ", buf[0x89:min(index, 0x89+0x0B)]))
+				err = errors.New("invalid client change cipher spec + finished header")
+				return
+			}
+		}
+
+		if index == 0xCC {
+			buf = buf[:index]
+			break
+		}
+
+		if index > 0xCC {
+			log.Println(moduleName, "Invalid client key exchange length:", index)
+			err = errors.New("invalid client key exchange length")
+			return
+		}
+	}
+
+	encryptedPreMasterSecret := buf[0x09 : 0x09+0x80]
+	clientFinish := buf[0x94 : 0x94+0x38]
+
+	finishHash.Write(buf[0x5 : 0x5+0x84])
+
+	// Decrypt the pre master secret using our RSA key
+	var preMasterSecret []byte
+	preMasterSecret, err = rsa.DecryptPKCS1v15(rand.Reader, rsaKey, encryptedPreMasterSecret)
+	if err != nil {
+		log.Println(moduleName, "Failed to decrypt pre master secret:", err)
+		return
+	}
+
+	if len(preMasterSecret) != 48 {
+		log.Println(moduleName, "Invalid pre master secret length:", len(preMasterSecret))
+		err = errors.New("invalid pre master secret length")
+		return
+	}
+
+	if !bytes.HasPrefix(preMasterSecret, []byte{0x03, 0x00}) {
+		log.Println(moduleName, "Invalid SSL version in pre master secret:", preMasterSecret[:2])
+		err = errors.New("invalid SSL version in pre master secret")
+		return
+	}
+
+	clientServerRandom := append(bytes.Clone(clientRandom), serverRandom[:0x20]...)
+
+	masterSecret := make([]byte, 48)
+	prf30(masterSecret, preMasterSecret, []byte("master secret"), clientServerRandom)
+
+	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, 16, 16, 16)
+
+	// Create the server RC4 cipher
+	cipher, err = rc4.NewCipher(serverKey)
+	if err != nil {
+		panic(err)
+	}
+
+	// Create the client RC4 cipher
+	clientCipher, err = rc4.NewCipher(clientKey)
+	if err != nil {
+		panic(err)
+	}
+
+	// Create the mac function
+	macFn = macMD5(serverMAC)
+
+	// Decrypt client finish
+	clientCipher.XORKeyStream(clientFinish, clientFinish)
+	finishHash.Write(clientFinish[:0x28])
+
+	// Send ChangeCipherSpec
+	_, err = conn.Write([]byte{
+		0x14,       // Content Type (Change Cipher Spec)
+		0x03, 0x00, // Version (SSL 3.0)
+		0x00, 0x01, // Length (1)
+		0x01, // Change Cipher Spec Message
+	})
+	if err != nil {
+		return
+	}
+
+	finishedRecord := []byte{
+		0x16,       // Content Type (Handshake)
+		0x03, 0x00, // Version (SSL 3.0)
+		0x00, 0x28, // Length (40)
+	}
+
+	out := finishHash.serverSum(masterSecret)
+
+	// Encrypt the finished record
+	finishedRecord, _ = encryptSSL(macFn, cipher, append([]byte{
+		0x14,             // Handshake Type (Finished)
+		0x00, 0x00, 0x24, // Length (36)
+	}, out[:36]...), 0, finishedRecord)
+
+	_, err = conn.Write(finishedRecord)
+
+	return
+}
+
+// The following functions are modified from the crypto standard library
+//
+// Copyright (c) 2009 The Go Authors. All rights reserved.
+//
+// Redistribution and use in source and binary forms, with or without
+// modification, are permitted provided that the following conditions are
+// met:
+//
+//    * Redistributions of source code must retain the above copyright
+// notice, this list of conditions and the following disclaimer.
+//    * Redistributions in binary form must reproduce the above
+// copyright notice, this list of conditions and the following disclaimer
+// in the documentation and/or other materials provided with the
+// distribution.
+//    * Neither the name of Google Inc. nor the names of its
+// contributors may be used to endorse or promote products derived from
+// this software without specific prior written permission.
+//
+// THIS SOFTWARE IS PROVIDED BY THE COPYRIGHT HOLDERS AND CONTRIBUTORS
+// "AS IS" AND ANY EXPRESS OR IMPLIED WARRANTIES, INCLUDING, BUT NOT
+// LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND FITNESS FOR
+// A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL THE COPYRIGHT
+// OWNER OR CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL,
+// SPECIAL, EXEMPLARY, OR CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT
+// LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR SERVICES; LOSS OF USE,
+// DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON ANY
+// THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT
+// (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
+// OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+// prf30 implements the SSL 3.0 pseudo-random function, as defined in
+// www.mozilla.org/projects/security/pki/nss/ssl/draft302.txt section 6.
+func prf30(result, secret, label, seed []byte) {
+	hashSHA1 := sha1.New()
+	hashMD5 := md5.New()
+
+	done := 0
+	i := 0
+	// RFC5246 section 6.3 says that the largest PRF output needed is 128
+	// bytes. Since no more ciphersuites will be added to SSLv3, this will
+	// remain true. Each iteration gives us 16 bytes so 10 iterations will
+	// be sufficient.
+	var b [11]byte
+	for done < len(result) {
+		for j := 0; j <= i; j++ {
+			b[j] = 'A' + byte(i)
+		}
+
+		hashSHA1.Reset()
+		hashSHA1.Write(b[:i+1])
+		hashSHA1.Write(secret)
+		hashSHA1.Write(seed)
+		digest := hashSHA1.Sum(nil)
+
+		hashMD5.Reset()
+		hashMD5.Write(secret)
+		hashMD5.Write(digest)
+
+		done += copy(result[done:], hashMD5.Sum(nil))
+		i++
+	}
+}
+
+// keysFromMasterSecret generates the connection keys from the master
+// secret, given the lengths of the MAC key, cipher key and IV, as defined in
+// RFC 2246, Section 6.3.
+func keysFromMasterSecret(masterSecret, clientRandom, serverRandom []byte, macLen, keyLen, ivLen int) (clientMAC, serverMAC, clientKey, serverKey, clientIV, serverIV []byte) {
+	seed := make([]byte, 0, len(serverRandom)+len(clientRandom))
+	seed = append(seed, serverRandom...)
+	seed = append(seed, clientRandom...)
+
+	n := 2*macLen + 2*keyLen + 2*ivLen
+	keyMaterial := make([]byte, n)
+	prf30(keyMaterial, masterSecret, []byte("key expansion"), seed)
+	clientMAC = keyMaterial[:macLen]
+	keyMaterial = keyMaterial[macLen:]
+	serverMAC = keyMaterial[:macLen]
+	keyMaterial = keyMaterial[macLen:]
+	clientKey = keyMaterial[:keyLen]
+	keyMaterial = keyMaterial[keyLen:]
+	serverKey = keyMaterial[:keyLen]
+	keyMaterial = keyMaterial[keyLen:]
+	clientIV = keyMaterial[:ivLen]
+	keyMaterial = keyMaterial[ivLen:]
+	serverIV = keyMaterial[:ivLen]
+	return
+}
+
+func newFinishedHash() finishedHash {
+	return finishedHash{sha1.New(), sha1.New(), md5.New(), md5.New()}
+}
+
+// A finishedHash calculates the hash of a set of handshake messages suitable
+// for including in a Finished message.
+type finishedHash struct {
+	client hash.Hash
+	server hash.Hash
+
+	// Prior to TLS 1.2, an additional MD5 hash is required.
+	clientMD5 hash.Hash
+	serverMD5 hash.Hash
+}
+
+func (h *finishedHash) Write(msg []byte) int {
+	h.client.Write(msg)
+	h.server.Write(msg)
+
+	h.clientMD5.Write(msg)
+	h.serverMD5.Write(msg)
+
+	return len(msg)
+}
+
+// finishedSum30 calculates the contents of the verify_data member of a SSLv3
+// Finished message given the MD5 and SHA1 hashes of a set of handshake
+// messages.
+func finishedSum30(md5, sha1 hash.Hash, masterSecret []byte, magic [4]byte) []byte {
+	md5.Write(magic[:])
+	md5.Write(masterSecret)
+	md5.Write(ssl30Pad1[:])
+	md5Digest := md5.Sum(nil)
+
+	md5.Reset()
+	md5.Write(masterSecret)
+	md5.Write(ssl30Pad2[:])
+	md5.Write(md5Digest)
+	md5Digest = md5.Sum(nil)
+
+	sha1.Write(magic[:])
+	sha1.Write(masterSecret)
+	sha1.Write(ssl30Pad1[:40])
+	sha1Digest := sha1.Sum(nil)
+
+	sha1.Reset()
+	sha1.Write(masterSecret)
+	sha1.Write(ssl30Pad2[:40])
+	sha1.Write(sha1Digest)
+	sha1Digest = sha1.Sum(nil)
+
+	ret := make([]byte, len(md5Digest)+len(sha1Digest))
+	copy(ret, md5Digest)
+	copy(ret[len(md5Digest):], sha1Digest)
+	return ret
+}
+
+// serverSum returns the contents of the verify_data member of a server's
+// Finished message.
+func (h finishedHash) serverSum(masterSecret []byte) []byte {
+	return finishedSum30(h.serverMD5, h.server, masterSecret, [4]byte{0x53, 0x52, 0x56, 0x52})
+}
+
+func encryptSSL(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint64, record []byte) ([]byte, uint64) {
+	mac := macFn.MAC([]byte{}, binary.BigEndian.AppendUint64([]byte{}, seq), record[:5], payload, nil)
+
+	record = append(append(bytes.Clone(record[:5]), payload...), mac...)
+	cipher.XORKeyStream(record[5:], record[5:])
+
+	// Update length to include nonce, MAC and any block padding needed.
+	n := len(record) - 5
+	record[3] = byte(n >> 8)
+	record[4] = byte(n)
+
+	return record, seq + 1
+}
+
+type macFunction interface {
+	MAC(out, seq, header, data, extra []byte) []byte
+}
+
+func macMD5(key []byte) macFunction {
+	mac := ssl30MAC{
+		h:   md5.New(),
+		key: make([]byte, len(key)),
+	}
+	copy(mac.key, key)
+	return mac
+}
+
+// ssl30MAC implements the SSLv3 MAC function, as defined in
+// www.mozilla.org/projects/security/pki/nss/ssl/draft302.txt section 5.2.3.1
+type ssl30MAC struct {
+	h   hash.Hash
+	key []byte
+}
+
+var ssl30Pad1 = [48]byte{0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36, 0x36}
+
+var ssl30Pad2 = [48]byte{0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c}
+
+func (s ssl30MAC) MAC(out, seq, header, data []byte, extra []byte) []byte {
+	padLength := 48
+	if s.h.Size() == 20 {
+		padLength = 40
+	}
+
+	s.h.Reset()
+	s.h.Write(s.key)
+	s.h.Write(ssl30Pad1[:padLength])
+	s.h.Write(seq)
+	s.h.Write(header[:1])
+	s.h.Write(header[3:5])
+	s.h.Write(data)
+	out = s.h.Sum(out[:0])
+
+	s.h.Reset()
+	s.h.Write(s.key)
+	s.h.Write(ssl30Pad2[:padLength])
+	s.h.Write(out)
+	return s.h.Sum(out[:0])
+}
