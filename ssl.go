@@ -219,12 +219,12 @@ func (s *sslSession) Read(b []byte) (n int, err error) {
 		return 0, errors.New("non-application data received")
 	}
 	// Write the decrypted content to the buffer
-	if int(recordLength-16) > len(b) {
-		s.decodedBuffer.Write(buf[5+len(b) : 5+recordLength-16])
+	if int(recordLength-md5.Size) > len(b) {
+		s.decodedBuffer.Write(buf[5+len(b) : 5+recordLength-md5.Size])
 	}
 	s.encodedBuffer.Next(5 + int(recordLength))
 
-	return copy(b, buf[5:5+recordLength-16]), nil
+	return copy(b, buf[5:5+recordLength-md5.Size]), nil
 }
 
 func (s *sslSession) Write(b []byte) (n int, err error) {
@@ -404,7 +404,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 	masterSecret := make([]byte, 48)
 	prf30(masterSecret, preMasterSecret, []byte("master secret"), clientServerRandom)
 
-	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, 16, 16, 16)
+	_, serverMAC, clientKey, serverKey, _, _ := keysFromMasterSecret(masterSecret, clientRandom, serverRandom, md5.Size, 16, 16)
 
 	// Create the server RC4 cipher
 	cipher, err = rc4.NewCipher(serverKey)
