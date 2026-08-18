@@ -305,19 +305,19 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 
 		index += n
 
-		// Check client key exchange header
-		if !bytes.HasPrefix(buf, []byte{
-			0x16,       // Content Type (Handshake)
-			0x03, 0x00, // Version (SSL 3.0)
-			0x00, 0x84, // Length (132)
-
-			// the dreamcast sends these in a separate packet
-			//0x10,             // Handshake Type (Client Key Exchange)
-			//0x00, 0x00, 0x80, // Length (128)
-		}) {
-			log.Println(moduleName, "Invalid client key exchange header:", fmt.Sprintf("% X ", buf[:min(index, 0x09-4)]))
-			err = errors.New("invalid client key exchange header")
-			return
+		if index > 0x09 {
+			// Check client key exchange header
+			if !bytes.HasPrefix(buf, []byte{
+				0x16,       // Content Type (Handshake)
+				0x03, 0x00, // Version (SSL 3.0)
+				0x00, 0x84, // Length (132)
+				0x10,             // Handshake Type (Client Key Exchange)
+				0x00, 0x00, 0x80, // Length (128)
+			}) {
+				log.Println(moduleName, "Invalid client key exchange header:", fmt.Sprintf("% X ", buf[:min(index, 0x09-4)]))
+				err = errors.New("invalid client key exchange header")
+				return
+			}
 		}
 
 		if index > 0x8B {
