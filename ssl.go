@@ -173,7 +173,7 @@ func (s *sslSession) Read(b []byte) (n int, err error) {
 		return s.decodedBuffer.Read(b)
 	}
 
-	recordLength := uint16(0)
+	var recordLength uint16
 	for {
 		for s.encodedBuffer.Len() < int(recordLength)+5 {
 			readBuf := make([]byte, 1024)
@@ -381,8 +381,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 	finishHash.Write(buf[0x5 : 0x5+0x84])
 
 	// Decrypt the pre master secret using our RSA key
-	var preMasterSecret []byte
-	preMasterSecret, err = rsa.DecryptPKCS1v15(rand.Reader, rsaKey, encryptedPreMasterSecret)
+	preMasterSecret, err := rsa.DecryptPKCS1v15(rand.Reader, rsaKey, encryptedPreMasterSecret)
 	if err != nil {
 		log.Println(moduleName, "Failed to decrypt pre master secret:", err)
 		return
