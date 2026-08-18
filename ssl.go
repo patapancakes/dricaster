@@ -411,13 +411,13 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 	// Create the server RC4 cipher
 	cipher, err = rc4.NewCipher(serverKey)
 	if err != nil {
-		panic(err)
+		return
 	}
 
 	// Create the client RC4 cipher
 	clientCipher, err = rc4.NewCipher(clientKey)
 	if err != nil {
-		panic(err)
+		return
 	}
 
 	// Create the mac function
