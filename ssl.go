@@ -421,7 +421,10 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 	}
 
 	// Create the mac function
-	macFn = macMD5(serverMAC)
+	macFn = ssl30MAC{
+		h:   md5.New(),
+		key: slices.Clone(serverMAC),
+	}
 
 	// Decrypt client finish
 	clientCipher.XORKeyStream(clientFinish, clientFinish)
@@ -622,14 +625,6 @@ func encryptSSL(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint6
 
 type macFunction interface {
 	MAC(out, seq, header, data, extra []byte) []byte
-}
-
-func macMD5(key []byte) macFunction {
-	mac := ssl30MAC{
-		h:   md5.New(),
-		key: slices.Clone(key),
-	}
-	return mac
 }
 
 // ssl30MAC implements the SSLv3 MAC function, as defined in
