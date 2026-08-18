@@ -20,6 +20,7 @@ import (
 	"io"
 	"log"
 	"net"
+	"slices"
 
 	_ "embed"
 )
@@ -602,9 +603,8 @@ type macFunction interface {
 func macMD5(key []byte) macFunction {
 	mac := ssl30MAC{
 		h:   md5.New(),
-		key: make([]byte, len(key)),
+		key: slices.Clone(key),
 	}
-	copy(mac.key, key)
 	return mac
 }
 
