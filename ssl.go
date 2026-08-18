@@ -189,11 +189,11 @@ func (s *sslSession) Read(b []byte) (n int, err error) {
 			return 0, errors.New("invalid record type")
 		}
 
-		if buf[1] != 0x03 || buf[2] != 0x00 {
+		if !bytes.Equal(buf[1:3], []byte{0x03, 0x00}) {
 			return 0, errors.New("invalid SSL version")
 		}
 
-		recordLength = binary.BigEndian.Uint16(buf[3:5])
+		recordLength = binary.BigEndian.Uint16(buf[3:])
 		if recordLength < 17 || (recordLength+5) > 0x1000 {
 			return 0, errors.New("invalid record length")
 		}
@@ -228,8 +228,10 @@ func (s *sslSession) Read(b []byte) (n int, err error) {
 }
 
 func (s *sslSession) Write(b []byte) (n int, err error) {
-	var record []byte
-	record, s.Seq = encryptSSL(s.MacFn, s.Cipher, b, s.Seq, []byte{0x17, 0x03, 0x01, byte(len(b) >> 8), byte(len(b))})
+	record := []byte{0x17, 0x03, 0x00}
+	record = binary.BigEndian.AppendUint16(record, uint16(len(b)))
+
+	record, s.Seq = encryptSSL(s.MacFn, s.Cipher, b, s.Seq, record)
 	return s.Conn.Write(record)
 }
 
@@ -613,9 +615,7 @@ func encryptSSL(macFn macFunction, cipher *rc4.Cipher, payload []byte, seq uint6
 	cipher.XORKeyStream(record[5:], record[5:])
 
 	// Update length to include nonce, MAC and any block padding needed.
-	n := len(record) - 5
-	record[3] = byte(n >> 8)
-	record[4] = byte(n)
+	binary.BigEndian.PutUint16(record[3:], uint16(len(record)-5))
 
 	return record, seq + 1
 }
@@ -645,7 +645,7 @@ var ssl30Pad2 = [48]byte{0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0x5c, 0
 
 func (s ssl30MAC) MAC(out, seq, header, data []byte, extra []byte) []byte {
 	padLength := 48
-	if s.h.Size() == 20 {
+	if s.h.Size() == sha1.Size {
 		padLength = 40
 	}
 
