@@ -134,7 +134,7 @@ func (c *sslConn) Close() error {
 	return c.Conn.Close()
 }
 
-// handleSSLHandshake handles the SSL request, and creates sslConn for further communication.
+// handleSSLHandshake handles the SSL request, and creates sslSession for further communication.
 func (c *sslConn) handleSSLHandshake() (err error) {
 	moduleName := "SSL:" + c.Conn.RemoteAddr().String()
 
