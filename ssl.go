@@ -233,6 +233,8 @@ func (s *sslSession) Write(b []byte) (n int, err error) {
 	return s.Conn.Write(record)
 }
 
+// handleHandshake expects a SSLv2 Client Hello as sent by the Dreamcast's ntSSL library.
+// it DOES NOT support Windows CE games as they only support export-grade ciphers.
 func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, cipher *rc4.Cipher, clientCipher *rc4.Cipher, err error) {
 	in := make([]byte, 1400)
 	n, err := conn.Read(in)
@@ -240,12 +242,35 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 		log.Println(moduleName, "Failed to read client hello:", err)
 		return
 	}
-	if n < 0x20 {
-		log.Println(moduleName, "Client hello too short")
-		return
-	}
 
 	clientHello := in[:n]
+
+	if !bytes.HasPrefix(clientHello, []byte{
+		0x80,       // (SSLv2, use 2 byte length header)
+		0x47,       // Length (71)
+		0x01,       // Handshake Type (Client Hello)
+		0x03, 0x00, // Version (SSL 3.0)
+		0x00, 0x1E, // Cipher Spec Length (30)
+		0x00, 0x00, // Session ID Length (0)
+		0x00, 0x20, // Challenge Length (32)
+
+		// SSLv2 cipher suites
+		0x01, 0x00, 0x80, // SSL2_RC4_128_WITH_MD5
+		0x02, 0x00, 0x80, // SSL2_RC4_128_EXPORT40_WITH_MD5
+
+		// SSLv3 cipher suites
+		0x00, 0x00, 0x00, // SSL_NULL_WITH_NULL_NULL (?)
+		0x00, 0x00, 0x01, // SSL_RSA_WITH_NULL_MD5
+		0x00, 0x00, 0x02, // SSL_RSA_WITH_NULL_SHA
+		0x00, 0x00, 0x03, // SSL_RSA_EXPORT_WITH_RC4_40_MD5
+		0x00, 0x00, 0x04, // SSL_RSA_WITH_RC4_128_MD5
+		0x00, 0x00, 0x05, // SSL_RSA_WITH_RC4_128_SHA
+		0x00, 0x00, 0x08, // SSL_RSA_EXPORT_WITH_DES40_CBC_SHA
+		0x00, 0x00, 0x09, // SSL_RSA_WITH_DES_CBC_SHA
+	}) {
+		log.Println(moduleName, "Not a Dreamcast ntSSL client hello")
+		return
+	}
 
 	finishHash := newFinishedHash()
 	finishHash.Write(clientHello[2:]) // skip SSLv2 length bytes
