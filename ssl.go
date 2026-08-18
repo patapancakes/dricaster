@@ -53,7 +53,7 @@ func setupSSL() error {
 
 	serverCertsRecord = []byte{
 		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 	}
 
 	certLen := len(certBlock.Bytes)
@@ -88,7 +88,7 @@ func setupSSL() error {
 
 	serverCertsRecord = append(serverCertsRecord, []byte{
 		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x04, // Length (4)
 		0x0E,             // Handshake Type (Server Hello Done)
 		0x00, 0x00, 0x00, // Length (0)
@@ -251,7 +251,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 		0x80,       // (SSLv2, use 2 byte length header)
 		0x47,       // Length (71)
 		0x01,       // Handshake Type (Client Hello)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x1E, // Cipher Spec Length (30)
 		0x00, 0x00, // Session ID Length (0)
 		0x00, 0x20, // Challenge Length (32)
@@ -282,11 +282,11 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 
 	serverHello := []byte{
 		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x2A, // Length (42)
 		0x02,             // Handshake Type (Server Hello)
 		0x00, 0x00, 0x26, // Length (38)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 	}
 
 	serverRandom := make([]byte, 0x20)
@@ -336,7 +336,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 			// Check client key exchange header
 			if !bytes.HasPrefix(buf, []byte{
 				0x16,       // Content Type (Handshake)
-				0x03, 0x00, // Version (SSL 3.0)
+				0x03, 0x00, // Version (SSLv3)
 				0x00, 0x84, // Length (132)
 				0x10,             // Handshake Type (Client Key Exchange)
 				0x00, 0x00, 0x80, // Length (128)
@@ -351,12 +351,12 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 			// Check change cipher spec + finished header
 			if !bytes.HasPrefix(buf[0x89:], []byte{
 				0x14,       // Content Type (Change Cipher Spec)
-				0x03, 0x00, // Version (SSL 3.0)
+				0x03, 0x00, // Version (SSLv3)
 				0x00, 0x01, // Length (1)
 				0x01, // Change Cipher Spec Message
 
 				0x16,       // Content Type (Handshake)
-				0x03, 0x00, // Version (SSL 3.0)
+				0x03, 0x00, // Version (SSLv3)
 				0x00, 0x38, // Length (56)
 			}) {
 				log.Println(moduleName, "Invalid client change cipher spec + finished header:", fmt.Sprintf("%X ", buf[0x89:min(index, 0x89+0x0B)]))
@@ -433,7 +433,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 	// Send ChangeCipherSpec
 	_, err = conn.Write([]byte{
 		0x14,       // Content Type (Change Cipher Spec)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x01, // Length (1)
 		0x01, // Change Cipher Spec Message
 	})
@@ -443,7 +443,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 
 	finishedRecord := []byte{
 		0x16,       // Content Type (Handshake)
-		0x03, 0x00, // Version (SSL 3.0)
+		0x03, 0x00, // Version (SSLv3)
 		0x00, 0x28, // Length (40)
 	}
 
@@ -490,7 +490,7 @@ func handleHandshake(moduleName string, conn io.ReadWriter) (macFn macFunction, 
 // (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 // OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
-// prf30 implements the SSL 3.0 pseudo-random function, as defined in
+// prf30 implements the SSLv3 pseudo-random function, as defined in
 // www.mozilla.org/projects/security/pki/nss/ssl/draft302.txt section 6.
 func prf30(result, secret, label, seed []byte) {
 	hashSHA1 := sha1.New()
