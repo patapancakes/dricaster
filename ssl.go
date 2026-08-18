@@ -194,7 +194,7 @@ func (s *sslSession) Read(b []byte) (n int, err error) {
 		}
 
 		recordLength = binary.BigEndian.Uint16(buf[3:])
-		if recordLength < 17 || (recordLength+5) > 0x1000 {
+		if recordLength < 1+md5.Size || (recordLength+5) > 0x1000 {
 			return 0, errors.New("invalid record length")
 		}
 
