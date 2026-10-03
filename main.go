@@ -4,8 +4,10 @@ import (
 	"flag"
 	"fmt"
 	"log"
-	"net"
 	"net/http"
+	"net/netip"
+
+	"github.com/patapancakes/sslspoof"
 )
 
 func main() {
@@ -15,27 +17,23 @@ func main() {
 	addr := flag.String("addr", "0.0.0.0:443", "address to listen on")
 	flag.Parse()
 
-	err := setupSSL()
+	l, err := sslspoof.NewListener(*addr, "auth01.dricas.com", true)
 	if err != nil {
 		panic(err)
 	}
 
-	l, err := net.Listen("tcp", *addr)
-	if err != nil {
-		panic(err)
-	}
-
-	listener := sslListener{Listener: l}
-	defer listener.Close()
+	defer l.Close()
 
 	http.HandleFunc("POST /cgi-bin/auth.cgi", func(w http.ResponseWriter, r *http.Request) {
-		log.Println("Got auth request from", r.RemoteAddr)
+		r.ParseForm()
+		addrport, _ := netip.ParseAddrPort(r.RemoteAddr)
+		log.Printf("[%s] %v", addrport.Addr(), r.PostForm)
 		w.WriteHeader(http.StatusOK)
 	})
 
 	log.Println("Listening on", *addr)
 
-	err = http.Serve(&listener, nil)
+	err = http.Serve(l, nil)
 	if err != nil {
 		panic(err)
 	}
